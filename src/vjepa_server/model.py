@@ -71,7 +71,7 @@ class VJEPAModel:
         start_time = time.time()
 
         try:
-            from transformers import AutoModel, AutoProcessor
+            from transformers import AutoModel, AutoVideoProcessor
 
             # Determine torch dtype
             dtype = getattr(torch, self.config.torch_dtype)
@@ -86,8 +86,9 @@ class VJEPAModel:
                 trust_remote_code=self.config.trust_remote_code,
             )
 
-            # Load processor for input normalization
-            self.processor = AutoProcessor.from_pretrained(
+            # Load video processor for input normalization
+            # V-JEPA 2 uses AutoVideoProcessor, not AutoProcessor
+            self.processor = AutoVideoProcessor.from_pretrained(
                 self.config.model_name,
                 trust_remote_code=self.config.trust_remote_code,
             )
@@ -99,9 +100,12 @@ class VJEPAModel:
             # Determine primary device
             if torch.cuda.is_available():
                 self.device = torch.device("cuda:0")
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                self.device = torch.device("mps")
+                logger.info("Using Apple MPS backend")
             else:
                 self.device = torch.device("cpu")
-                logger.warning("CUDA not available, using CPU")
+                logger.warning("CUDA/MPS not available, using CPU")
 
             self._is_loaded = True
             load_time = time.time() - start_time
@@ -141,6 +145,7 @@ class VJEPAModel:
 
         Args:
             video_tensor: Input tensor of shape (T, C, H, W) or (B, T, C, H, W)
+                         Should be raw pixel values in [0, 1] range
             return_pooled: If True, return mean-pooled embedding across frames
 
         Returns:
@@ -150,32 +155,32 @@ class VJEPAModel:
         if not self._is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
 
-        # Ensure 5D input: (B, T, C, H, W)
-        if video_tensor.dim() == 4:
-            video_tensor = video_tensor.unsqueeze(0)  # Add batch dimension
+        # Ensure 4D input for processor: (T, C, H, W) where T is num frames
+        if video_tensor.dim() == 5:
+            # Remove batch dimension if present (B, T, C, H, W) -> (T, C, H, W)
+            video_tensor = video_tensor.squeeze(0)
 
-        # Move to appropriate device and dtype
-        video_tensor = video_tensor.to(self.device, dtype=self.model.dtype)
+        # Convert to list of PIL-like format for processor
+        # Processor expects (T, C, H, W) with values in [0, 255] range
+        video_array = (video_tensor.numpy() * 255).astype(np.uint8)
+        # Transpose to (T, H, W, C) for processor
+        video_array = video_array.transpose(0, 2, 3, 1)
+
+        # Process video through V-JEPA processor
+        inputs = self.processor(list(video_array), return_tensors="pt")
+
+        # Move to device
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         with torch.no_grad():
-            # Get encoder outputs
-            # V-JEPA returns hidden states from vision transformer
-            outputs = self.model(video_tensor, return_dict=True)
+            # Use get_vision_features() - the correct API for V-JEPA 2
+            embeddings = self.model.get_vision_features(**inputs)
 
-            # Extract embeddings from last hidden state
-            # Shape: (B, T, num_patches, hidden_dim) or similar
-            if hasattr(outputs, "last_hidden_state"):
-                embeddings = outputs.last_hidden_state
-            elif hasattr(outputs, "pooler_output"):
-                embeddings = outputs.pooler_output
-            else:
-                # Fallback: use first output
-                embeddings = outputs[0] if isinstance(outputs, tuple) else outputs
-
-            # Pool across spatial dimensions if needed
-            if embeddings.dim() > 2:
-                # Global average pooling over spatial/temporal dimensions
-                embeddings = embeddings.mean(dim=list(range(1, embeddings.dim() - 1)))
+            # embeddings shape: (1, num_patches, hidden_dim)
+            # Pool across patches if needed
+            if embeddings.dim() > 2 and return_pooled:
+                # Global average pooling over patches
+                embeddings = embeddings.mean(dim=1)
 
             # Squeeze batch dimension for single video
             if embeddings.size(0) == 1:
@@ -192,6 +197,7 @@ class VJEPAModel:
 
         Args:
             frames: Video frames as numpy array (T, C, H, W) or nested list
+                   Values should be in [0, 1] range
             return_pooled: If True, return mean-pooled embedding
 
         Returns:
@@ -199,9 +205,17 @@ class VJEPAModel:
         """
         start_time = time.time()
 
-        # Convert to tensor
+        # Convert to numpy array if needed
         if isinstance(frames, list):
             frames = np.array(frames, dtype=np.float32)
+        elif not isinstance(frames, np.ndarray):
+            frames = np.array(frames, dtype=np.float32)
+
+        # Ensure float32
+        if frames.dtype != np.float32:
+            frames = frames.astype(np.float32)
+
+        # Create tensor
         tensor = torch.from_numpy(frames)
 
         # Encode
@@ -214,8 +228,8 @@ class VJEPAModel:
 
         return {
             "embeddings": embeddings_np.tolist(),
-            "embedding_dim": embeddings_np.shape[-1],
-            "num_frames": frames.shape[0],
+            "embedding_dim": int(embeddings_np.shape[-1]) if embeddings_np.ndim > 0 else 1,
+            "num_frames": int(frames.shape[0]),
             "inference_time_ms": inference_time,
         }
 
